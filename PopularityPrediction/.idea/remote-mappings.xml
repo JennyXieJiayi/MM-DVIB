@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RemoteMappingsManager">
+    <list>
+      <list>
+        <remote-mappings server-id="python@sftp://xiejiayi@DMAL-cong1.dynip.ntu.edu.sg:22/home/xiejiayi/anaconda3/envs/unifiedssr/bin/python3" />
+        <remote-mappings server-id="python@sftp://xiejiayi@10.102.100.59:22/home/xiejiayi/anaconda3/envs/PopPred/bin/python3" />
+        <remote-mappings server-id="python@sftp://xiejiayi@10.102.100.59:22/home/xiejiayi/anaconda3/envs/pytorch/bin/python" />
+      </list>
+    </list>
+  </component>
+</project>

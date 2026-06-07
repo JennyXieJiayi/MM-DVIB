@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="IIP_DMMVED_REG" remoteFilesAllowedToDisappearOnAutoupload="false" showAutoUploadSettingsWarning="false">
+    <serverData>
+      <paths name="Copy of project-level server 'IIP_DMMVED_REG'">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/xiejiayi/Project/DMMVED/DMMVED_REG" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="IIP_DMMVED_REG">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/xiejiayi/Project/DMMVED/DMMVED_REG" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
