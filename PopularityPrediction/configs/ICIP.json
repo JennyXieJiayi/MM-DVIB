@@ -1,0 +1,29 @@
+{
+  "dataset": "ICIP",
+  "lambda_u": 0.2,
+  "lambda_v": 0.2,
+  "factor_uv": 0.4,
+  "content_coefficient_min": 0.45,
+  "train_batch_size": 128,
+  "test_batch_size": 512,
+  "user_emb_dim": 8,
+  "hid_size": 8,
+  "dropout": 0.5,
+  "modalities": [
+    "visual",
+    "textual"
+  ],
+  "mod2dim_dict": {
+    "visual": 768,
+    "textual": 768
+  },
+  "mod2feat_dict": {
+    "visual": "visual",
+    "textual": "textual"
+  },
+  "user_dim": 9,
+  "optimizer_name": "adamw",
+  "weight_decay": 0.01,
+  "dec_type": "ffn",
+  "target_transform": "identity"
+}

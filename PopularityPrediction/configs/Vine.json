@@ -1,0 +1,32 @@
+{
+  "dataset": "Vine",
+  "lambda_u": 0.2,
+  "lambda_v": 0.2,
+  "factor_uv": 0.2,
+  "content_coefficient_min": 0.4,
+  "train_batch_size": 256,
+  "test_batch_size": 512,
+  "user_emb_dim": 8,
+  "hid_size": 8,
+  "dropout": 0.5,
+  "modalities": [
+    "visual",
+    "aural",
+    "textual"
+  ],
+  "mod2dim_dict": {
+    "visual": 128,
+    "aural": 128,
+    "textual": 101
+  },
+  "mod2feat_dict": {
+    "visual": "visual",
+    "aural": "aural",
+    "textual": "textual"
+  },
+  "user_dim": 7,
+  "optimizer_name": "adamw",
+  "weight_decay": 0.01,
+  "dec_type": "ffn",
+  "target_transform": "log"
+}

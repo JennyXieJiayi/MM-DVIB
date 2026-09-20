@@ -28,15 +28,19 @@ class FeedForward(nn.Module):
 		return x
 
 class UserEncoder(nn.Module):
-	def __init__(self, num_u, in_size, emb_size, hid_size, activation, drop_p=0.2):
+	def __init__(self, num_u, in_size, emb_size, hid_size, activation, drop_p=0.2, padding_idx=None):
 		super(UserEncoder, self).__init__()
 		self.emb_size = emb_size
-		self.user_emb = nn.Embedding(num_u, emb_size)
+		self.padding_idx = padding_idx
+		self.user_emb = nn.Embedding(num_u, emb_size, padding_idx=padding_idx)
 		self.linear = nn.Linear(emb_size+in_size-1, hid_size*4)
 		self.mean_std = clones(FeedForward(in_size=hid_size*4, out_size=hid_size, activation=activation, drop_p=drop_p), 2)
 
 	def forward(self, u_in):
-		u_emb = self.user_emb(u_in[:,0].long()) * math.sqrt(self.emb_size)
+		user_ids = u_in[:, 0].long()
+		u_emb = self.user_emb(user_ids)
+		u_emb = u_emb.masked_fill(user_ids.eq(self.padding_idx).unsqueeze(-1), 0.0)
+		u_emb = u_emb * math.sqrt(self.emb_size)
 		u_rep = torch.cat((u_emb, u_in[:,1:]), -1)
 		u_rep = self.linear(u_rep)
 		u_mean = self.mean_std[0](u_rep)
@@ -47,6 +51,7 @@ class UserEncoder(nn.Module):
 class VideoEncoder(nn.Module):
 	def __init__(self, in_sizes, hid_size, modalities, activation, drop_p=0.2):
 		super(VideoEncoder, self).__init__()
+		self.modalities = tuple(modalities)
 		self.mod_encoder = nn.ModuleDict()
 		if 'visual' in modalities:
 			hid_sizes = [hid_size*4, hid_size]
@@ -60,10 +65,10 @@ class VideoEncoder(nn.Module):
 
 	def forward(self, mods_in, sampled_z_u):
 		mods_dist = []
-		for mod_in_key, mod_in in mods_in.items():
-			mods_dist.append(self.mod_encoder[mod_in_key](mod_in, sampled_z_u))
+		for name in self.modalities:
+			mods_dist.append(self.mod_encoder[name](mods_in[name], sampled_z_u))
 		mean_list, std_list = zip(*mods_dist)
-		return self.poe(torch.stack(mean_list, dim=-1), torch.stack(std_list, dim=-1))
+		return self.poe(torch.stack(mean_list, dim=0).movedim(0, -1), torch.stack(std_list, dim=0).movedim(0, -1))
 
 	def poe(self, mean_list, std_list):
 		# mean_list: (B, hid_size, num_mod)
@@ -103,37 +108,6 @@ class Sampler(nn.Module):
 		return mean + std * eps
 
 
-class PositionalEncoding(nn.Module):
-	def __init__(self, d_model, drop_p, max_len=100):
-		super(PositionalEncoding, self).__init__()
-		self.dropout = nn.Dropout(p=drop_p)
-
-		# Compute the positional encodings once in log space.
-		pe = torch.zeros(max_len, d_model)
-		position = torch.arange(0., max_len).unsqueeze(1)
-		div_term = torch.exp(torch.arange(0., d_model, 2) *
-		                     -(math.log(10000.0) / d_model))
-		pe[:, 0::2] = torch.sin(position * div_term)
-		pe[:, 1::2] = torch.cos(position * div_term)
-		pe = pe.unsqueeze(0)
-		self.register_buffer('pe', pe)
-
-	def forward(self, x):
-		x = x + self.pe[:, :x.size(1)].requires_grad_(False)
-		return self.dropout(x)
-
-
-def attention(query, key, value, mask=None, dropout=None):
-	d_k = query.size(-1)
-	scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-	if mask is not None:
-		scores = scores.masked_fill(mask == 0, -1e9)
-	p_attn = scores.softmax(dim=-1)
-	if dropout is not None:
-		p_attn = dropout(p_attn)
-	return torch.matmul(p_attn, value), p_attn
-
-
 class Decoder(nn.Module):
 	def __init__(self, hid_size, dec_obj, dec_type='ffn', drop_p=0.2):
 		super(Decoder, self).__init__()
@@ -158,14 +132,14 @@ class Decoder(nn.Module):
 			sampled_z = sampled_zs
 		if self.dec_type == 'ffn':
 			out = self.decoder(sampled_z)
-		return self.linear_dec(out).squeeze()
+		return self.linear_dec(out).squeeze(-1)
 	
 
 class DMMVED(nn.Module):
-	def __init__(self, num_u, u_in_size, u_emb_size, dec_type, hid_size, mod_in_sizes, modalities, activation=nn.ReLU, drop_p=0.2):
+	def __init__(self, num_u, u_in_size, u_emb_size, dec_type, hid_size, mod_in_sizes, modalities, user_padding_idx, activation=nn.ReLU, drop_p=0.2):
 		super(DMMVED, self).__init__()
 		assert dec_type in ['ffn']
-		self.u_encoder = UserEncoder(num_u, u_in_size, u_emb_size, hid_size, activation, drop_p)
+		self.u_encoder = UserEncoder(num_u, u_in_size, u_emb_size, hid_size, activation, drop_p, padding_idx=user_padding_idx)
 		self.u_sampler = Sampler()
 		self.u_decoder = Decoder(hid_size, 'user', dec_type, drop_p=drop_p)
 
@@ -174,10 +148,7 @@ class DMMVED(nn.Module):
 		self.decoder = Decoder(hid_size, 'video', dec_type, drop_p=drop_p)
 
 	def forward(self, u_feat, v_feat):
-		# u_feat: (B, 7) id + 6d feat
-		# v_feat: dict
-		#         key: visual, aural, textual
-		#         value: (B, 2048), (B, 128), (B, 101)
+		# u_feat: (batch, user_dim), with the user ID in column 0
 		u_mean, u_std = self.u_encoder(u_feat)
 		sampled_z_u = self.u_sampler(u_mean, u_std)
 		out_mean_pop = self.u_decoder(sampled_z_u)
@@ -203,7 +174,3 @@ class DMMVED(nn.Module):
 		kld_final = torch.mean(kl_divergence(Normal(mu_v, std_v), z_v_prior))
 		loss = factor_uv * (recon_mean + lambd_u * kld_mean) + recon_final + lambd_v * kld_final
 		return loss, kld_mean, recon_mean, kld_final, recon_final
-
-
-if __name__ == "__main__":
-	pass

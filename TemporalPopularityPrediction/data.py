@@ -3,113 +3,96 @@
 Pytorch Implementation of MM-DVIB model in:
 Disentangling User Influence and Multimodal Content for Micro-video Popularity Prediction
 '''
-import os
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
-class XiguaDataset(Dataset):
-	def __init__(self, phase, pop_len, data_root, split_idx, modalities, mod2feat_dict, time_emb=False, logging=None, num_test_neg=None):
-		assert phase in ['train', 'val', 'test']
-
-		self.pop_len = pop_len
-		train_idx_path = os.path.join(data_root, 'split/{}'.format(split_idx), 'train.txt')
-		train_idx = pd.read_table(train_idx_path, header=None).values.squeeze()
-
-		phase_idx_path = os.path.join(data_root, 'split/{}'.format(split_idx), '{}.txt'.format(phase))
-		phase_idx = pd.read_table(phase_idx_path, header=None).values.squeeze()
-
-		vuid_file = os.path.join(data_root, 'vuid_list.txt')
-		vuids_all = pd.read_table(vuid_file, header=None, dtype=str, sep=',')
-		vuids_all.columns = ['vid', 'uid']
-
-		target_file = os.path.join(data_root, 'target', 'len_{}'.format(pop_len), 'target.npy')
-		target_unnorm_all = np.load(target_file)[:, :, 0] # unnorm pop for mean pop
-		self.target = np.load(target_file)[phase_idx, :, -2] # norm pop
-
-		self.time_emb = time_emb
-		if time_emb:
-			self.time = np.load(target_file)[phase_idx, :, 1]  # unnorm time
-		else:
-			self.time = np.load(target_file)[phase_idx, :, -1] # norm time
-
-		u_feat_file = os.path.join(data_root, 'user.npy')
-		self.u_feat = np.load(u_feat_file)[phase_idx]
-
-		self.v_feat = {}
-		for modality in modalities:
-			mod_file = os.path.join(data_root, "{}.npy".format(mod2feat_dict[modality]))
-			self.v_feat[modality] = np.load(mod_file)[phase_idx]
-
-		self.mean_pop = self.get_mean_pop(vuids_all, target_unnorm_all, train_idx, phase_idx) # norm pop
-
-	def get_mean_pop(self, vuids, target, train_idxes, phase_idxes):
-		### use train set to calculate mean pop
-		### new users in test / val use zero mean pop
-
-		# 1. calculate the mean pop of users in train set (for train&val) or train/val set (for test)
-		uids_known = vuids['uid'][train_idxes].tolist()
-		tgt_known = target[train_idxes]
-		unique_uids = list(set(uids_known))
-		uids_vcount = np.zeros(len(unique_uids))
-		uids_sum_pop = np.zeros((len(unique_uids), target.shape[1]))
-		for idx, uid in enumerate(uids_known):
-			uids_vcount[unique_uids.index(uid)] += 1
-			uids_sum_pop[unique_uids.index(uid)] += tgt_known[idx,:]
-		uids_mean_pop = uids_sum_pop / uids_vcount.reshape(-1, 1)
-		uids_mean_pop = (uids_mean_pop - uids_mean_pop.mean()) / uids_mean_pop.std() # normalization
-		uids_mean_pop_missing = np.zeros_like(uids_mean_pop[0])
-
-		# 2. map to the phase set
-		vids_mean_pop = np.zeros((len(phase_idxes), target.shape[1]))
-		vids_unknown = vuids['vid'][phase_idxes].tolist()
-		uids_unknown = vuids['uid'][phase_idxes].tolist()
-		for idx, (vid, uid) in enumerate(zip(vids_unknown, uids_unknown)):
-			if uid in unique_uids:
-				vids_mean_pop[idx] = uids_mean_pop[unique_uids.index(uid)]
-			else:
-				vids_mean_pop[idx] = uids_mean_pop_missing
-		return vids_mean_pop
-
-	def __len__(self):
-		return len(self.target)
-
-	def __getitem__(self, index):
-		if self.time_emb:
-			sample_time = torch.tensor([self.time[index]], dtype=torch.long)
-		else:
-			sample_time = torch.tensor([self.time[index]], dtype=torch.float32)
-
-		samples = {
-			'u_feat': torch.tensor([self.u_feat[index]], dtype=torch.float32),
-			'v_feat': {key: torch.tensor(mod[index], dtype=torch.float32) for key, mod in self.v_feat.items()},
-			'time': sample_time,
-			'tgt_pop': torch.tensor([self.target[index]], dtype=torch.float32),
-			'tgt_mean_pop': torch.tensor([self.mean_pop[index]], dtype=torch.float32)
-		}
-		return samples
+from utils.data_utils import load_splits, prepare_users, user_targets, check_features
 
 
-if __name__ == "__main__":
-	# for test only
-	modalities = ['visual', 'aural', 'textual']
-	mod2feat_dict = {
-		'visual': 'resnet50',
-		'aural': 'audiovgg',
-		'textual': 'fudannlp'
-	}
-	data4test = XiguaDataset('train', 9, './data/', 10, modalities, mod2feat_dict)
-	print(len(data4test)) # total sample num
-	dataloader4test = DataLoader(data4test, batch_size=128, shuffle=True)
-	print(len(dataloader4test)) # batch num
-	for i_batch, batch_data in enumerate(dataloader4test):
-		print(batch_data['u_feat'].shape)
-		print(batch_data['v_feat'].keys())
-		print(batch_data['v_feat']['visual'].shape)
-		print(batch_data['v_feat']['aural'].shape)
-		print(batch_data['v_feat']['textual'].shape)
-		print(batch_data['time'].shape)
-		print(batch_data['tgt_pop'].shape)
-		print(batch_data['tgt_mean_pop'].shape)
-		break
+CATEGORY_IDS = {'Travel  Events': 0, 'People  Blogs': 1, 'Gaming': 2,
+                'News  Politics': 3, 'Entertainment': 4, 'Music': 5,
+                'Education': 6, 'Sports': 7, 'Howto  Style': 8,
+                'Film  Animation': 9, 'Nonprofits  Activism': 10,
+                'Travel': 11, 'Comedy': 12, 'Science  Technology': 13,
+                'Autos  Vehicles': 14, 'Pets  Animals': 15}
+
+
+class TemporalPopularityDataset(Dataset):
+    def __init__(self, args, phase, preprocessing=None):
+        root = Path(args.data_root)
+        self.dataset = args.dataset
+        if args.dataset == 'Xigua':
+            target_array = np.load(root / f'target/len_{args.pop_len}/target.npy', mmap_mode='r')
+            target = np.asarray(target_array[:, :, 0], dtype=np.float64)
+        else:
+            target = np.load(root / 'target_first9_daily_view_count_increment_log2p1.npy', mmap_mode='r')
+        if target.ndim != 2 or target.shape[1] != args.pop_len:
+            raise ValueError('Target sequence length does not match pop_len')
+        splits, hashes = load_splits(args.splits_root, args.dataset, args.split_idx, len(target))
+        self.indices = splits[phase]
+        if preprocessing is None:
+            train_target = np.asarray(target[splits['train']], dtype=np.float64)
+            target_state = dict(mean=float(train_target.mean()), std=float(train_target.std()))
+            user_state = None
+        else:
+            if preprocessing['split_hashes'] != hashes:
+                raise ValueError('Checkpoint and data splits differ')
+            target_state, user_state = preprocessing['target'], preprocessing['user']
+        self.target_mean, self.target_std = target_state['mean'], target_state['std']
+        if self.target_std <= 0 or not np.isfinite(self.target_std):
+            raise ValueError('Invalid target variance')
+        self.target = ((target[self.indices] - self.target_mean) / self.target_std).astype(np.float32)
+        users = np.load(root / 'user.npy')
+        if users.shape != (len(target), args.user_dim):
+            raise ValueError('User feature shape does not match the dataset configuration')
+        self.users, self.user_state = prepare_users(users, splits['train'], user_state)
+        self.features = {name: np.load(root / f'{filename}.npy', mmap_mode='r')
+                         for name, filename in args.mod2feat_dict.items()}
+        check_features(self.features, args.mod2dim_dict, len(target))
+        if args.dataset == 'Xigua':
+            ids = pd.read_csv(root / 'vuid_list.txt', header=None, dtype=str)
+            if ids.shape != (len(target), 2):
+                raise ValueError('vuid_list.txt must align with feature rows')
+            user_ids = ids.iloc[:, 1].to_numpy()
+            self.time = target_array[self.indices, :, -1]
+        else:
+            user_ids = users[:, 0].astype(np.int64)
+            days = np.arange(1, 31, dtype=np.float32)
+            self.time = ((days - days.mean()) / days.std())[:9]
+            category_map = json.loads((root / 'category_mapping.json').read_text())
+            lookup = np.empty(len(category_map), dtype=np.int64)
+            for name, cached_id in category_map.items():
+                lookup[cached_id] = CATEGORY_IDS[name]
+            self.category = lookup[np.load(root / 'category.npy')[:, 0]]
+            self.language = np.load(root / 'language.npy')[:, 0]
+            self.metadata = np.load(root / 'content_metadata.npy', mmap_mode='r')
+            cfg = args.structured_config
+            if (self.category.shape != (len(target),) or self.language.shape != (len(target),)
+                    or self.metadata.shape != (len(target), cfg['metadata_dim'])
+                    or self.category.min() < 0 or self.category.max() >= cfg['category_count']
+                    or self.language.min() < 0 or self.language.max() >= cfg['language_count']):
+                raise ValueError('Invalid SMTPD structured feature shapes or IDs')
+        self.user_pop = user_targets(user_ids, target, splits['train'])
+        self.preprocessing = dict(target=target_state, user=self.user_state, split_hashes=hashes)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, position):
+        index = self.indices[position]
+        content = {name: torch.tensor(value[index], dtype=torch.float32)
+                   for name, value in self.features.items()}
+        if self.dataset == 'SMTPD':
+            content['structured'] = dict(category=torch.tensor(self.category[index]),
+                                         language=torch.tensor(self.language[index]),
+                                         metadata=torch.tensor(self.metadata[index], dtype=torch.float32))
+        time = self.time[position] if self.dataset == 'Xigua' else self.time
+        return dict(u_feat=torch.tensor(self.users[index], dtype=torch.float32), v_feat=content,
+                    time=torch.tensor(time, dtype=torch.float32),
+                    tgt_pop=torch.tensor(self.target[position]),
+                    tgt_mean_pop=torch.tensor(self.user_pop[index]), index=torch.tensor(index))

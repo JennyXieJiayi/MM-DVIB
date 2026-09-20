@@ -31,15 +31,19 @@ class FeedForward(nn.Module):
 
 
 class UserEncoder(nn.Module):
-	def __init__(self, num_u, in_size, emb_size, hid_size, activation, drop_p=0.2):
+	def __init__(self, num_u, in_size, emb_size, hid_size, activation, drop_p=0.2, padding_idx=None):
 		super(UserEncoder, self).__init__()
 		self.emb_size = emb_size
-		self.user_emb = nn.Embedding(num_u, emb_size)
+		self.padding_idx = padding_idx
+		self.user_emb = nn.Embedding(num_u, emb_size, padding_idx=padding_idx)
 		self.linear = nn.Linear(emb_size+in_size-1, hid_size)
 		self.mean_std = clones(FeedForward(in_size=hid_size, activation=activation, drop_p=drop_p), 2)
 
 	def forward(self, u_in):
-		u_emb = self.user_emb(u_in[:,0].long()) * math.sqrt(self.emb_size)
+		user_ids = u_in[:, 0].long()
+		u_emb = self.user_emb(user_ids)
+		u_emb = u_emb.masked_fill(user_ids.eq(self.padding_idx).unsqueeze(-1), 0.0)
+		u_emb = u_emb * math.sqrt(self.emb_size)
 		u_rep = torch.cat((u_emb, u_in[:,1:]), -1)
 		u_rep = self.linear(u_rep)
 		u_mean = self.mean_std[0](u_rep)
@@ -50,6 +54,7 @@ class UserEncoder(nn.Module):
 class VideoEncoder(nn.Module):
 	def __init__(self, in_sizes, hid_size, modalities, activation, drop_p=0.2):
 		super(VideoEncoder, self).__init__()
+		self.modalities = tuple(modalities)
 		self.mod_encoder = nn.ModuleDict()
 		if 'visual' in modalities:
 			hid_sizes = [hid_size*2, hid_size]
@@ -60,13 +65,15 @@ class VideoEncoder(nn.Module):
 		if 'textual' in modalities:
 			hid_sizes = [hid_size, hid_size]
 			self.mod_encoder['textual'] = ModalEncoder(in_sizes['textual'], hid_sizes, activation, drop_p)
+		if 'structured' in modalities:
+			self.mod_encoder['structured'] = ModalEncoder(in_sizes['structured'], [hid_size, hid_size], activation, drop_p)
 
 	def forward(self, mods_in, sampled_z_u):
 		mods_dist = []
-		for mod_in_key, mod_in in mods_in.items():
-			mods_dist.append(self.mod_encoder[mod_in_key](mod_in, sampled_z_u))
+		for name in self.modalities:
+			mods_dist.append(self.mod_encoder[name](mods_in[name], sampled_z_u))
 		mean_list, std_list = zip(*mods_dist)
-		return self.poe(torch.stack(mean_list, dim=-1), torch.stack(std_list, dim=-1))
+		return self.poe(torch.stack(mean_list, dim=0).movedim(0, -1), torch.stack(std_list, dim=0).movedim(0, -1))
 
 	def poe(self, mean_list, std_list):
 		# mean_list: (B, hid_size, num_mod)
@@ -137,6 +144,33 @@ def attention(query, key, value, mask=None, dropout=None):
 	return torch.matmul(p_attn, value), p_attn
 
 
+class StructuredContentEmbedding(nn.Module):
+	def __init__(
+		self,
+		category_count,
+		language_count,
+		metadata_dim,
+		category_emb_dim=128,
+		language_emb_dim=128,
+	):
+		super(StructuredContentEmbedding, self).__init__()
+		self.category_embedding = nn.Embedding(category_count, category_emb_dim)
+		self.language_embedding = nn.Embedding(language_count, language_emb_dim)
+		self.metadata_dim = metadata_dim
+		self.output_dim = category_emb_dim + language_emb_dim + metadata_dim
+
+	def forward(self, structured):
+		metadata = structured['metadata']
+		if metadata.size(-1) != self.metadata_dim:
+			raise ValueError(
+				f"Expected {self.metadata_dim} structured metadata values, "
+				f"got {metadata.size(-1)}"
+			)
+		category = self.category_embedding(structured['category'].long())
+		language = self.language_embedding(structured['language'].long())
+		return torch.cat((category, language, metadata), dim=-1)
+
+
 class Decoder(nn.Module):
 	def __init__(self, emb_size, hid_size, dec_obj, dec_type='rnn', drop_p=0.2, num_t=24, num_layers=1):
 		super(Decoder, self).__init__()
@@ -186,15 +220,18 @@ class Decoder(nn.Module):
 			value = self.linear_v(self.pos_kv(sampled_z))
 			query = self.linear_q(self.pos_q(pop_time))
 			out, self.attn = attention(query, key, value, dropout=self.dropout)
-			return self.linear_dec(out).squeeze()
-		return self.conv1d_dec(out.permute(0, 2, 1)).squeeze()
+			return self.linear_dec(out).squeeze(-1)
+		return self.conv1d_dec(out.permute(0, 2, 1)).squeeze(1)
 
 
 class DMMVED(nn.Module):
-	def __init__(self, num_u, u_in_size, u_emb_size, t_emb_size, dec_type, hid_size, mod_in_sizes, modalities, activation=nn.ReLU, drop_p=0.2):
+	def __init__(self, num_u, u_in_size, u_emb_size, t_emb_size, dec_type, hid_size, mod_in_sizes, modalities, user_padding_idx, activation=nn.ReLU, drop_p=0.2, structured_config=None):
 		super(DMMVED, self).__init__()
 		assert dec_type in ['rnn', 'lstm', 'attn']
-		self.u_encoder = UserEncoder(num_u, u_in_size, u_emb_size, hid_size, activation, drop_p)
+		self.structured_encoder = None
+		if 'structured' in modalities:
+			self.structured_encoder = StructuredContentEmbedding(**structured_config)
+		self.u_encoder = UserEncoder(num_u, u_in_size, u_emb_size, hid_size, activation, drop_p, padding_idx=user_padding_idx)
 		self.u_sampler = Sampler()
 		self.u_decoder = Decoder(t_emb_size, hid_size, 'user', dec_type, drop_p=drop_p)
 
@@ -202,11 +239,16 @@ class DMMVED(nn.Module):
 		self.v_sampler = Sampler()
 		self.decoder = Decoder(t_emb_size, hid_size, 'video', dec_type, drop_p=drop_p)
 
+	def prepare_content(self, v_feat):
+		if self.structured_encoder is None:
+			return v_feat
+		v_feat = dict(v_feat)
+		v_feat["structured"] = self.structured_encoder(v_feat["structured"])
+		return v_feat
+
 	def forward(self, u_feat, v_feat, pop_time):
-		# u_feat: (B, 4) id + 3d feat
-		# v_feat: dict
-		#         key: visual, aural, textual
-		#         value: (B, 128), (B, 128), (B, 20)
+		v_feat = self.prepare_content(v_feat)
+		# u_feat: (batch, user_dim), with the user ID in column 0
 		# pop_time: (B, pop_len)
 		u_mean, u_std = self.u_encoder(u_feat)
 		sampled_z_u = self.u_sampler(u_mean, u_std)
@@ -218,6 +260,7 @@ class DMMVED(nn.Module):
 		return out_mean_pop, out_pop
 
 	def predict(self, u_feat, v_feat, pop_time):
+		v_feat = self.prepare_content(v_feat)
 		u_mean, _ = self.u_encoder(u_feat)
 		v_mean, _ = self.v_encoder(v_feat, u_mean)
 		out_pop = self.decoder(pop_time, (v_mean, u_mean))
@@ -233,12 +276,3 @@ class DMMVED(nn.Module):
 		kld_final = torch.mean(kl_divergence(Normal(mu_v, std_v), z_v_prior))
 		loss = factor_uv * (recon_mean + lambd_u * kld_mean) + recon_final + lambd_v * kld_final
 		return loss, kld_mean, recon_mean, kld_final, recon_final
-
-	def get_embs(self, u_feat, v_feat):
-		u_mean, _ = self.u_encoder(u_feat)
-		v_mean, _ = self.v_encoder(v_feat, u_mean)
-		return u_mean, v_mean
-
-
-if __name__ == "__main__":
-	pass
