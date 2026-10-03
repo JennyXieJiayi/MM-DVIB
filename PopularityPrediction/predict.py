@@ -3,61 +3,43 @@
 Pytorch Implementation of MM-DVIB model in:
 Disentangling User Influence and Multimodal Content for Micro-video Popularity Prediction
 '''
-from utils.parser import *
-from utils.utils import *
-from evaluate import *
-from data import *
-from model import *
-import torch
+import argparse
+import json
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
-import random
-import logging
+import torch
+
+from data import PopularityDataset
+from evaluate import evaluate
+from model import DMMVED
+from utils.parser import parse_args, DATASETS
+from utils.utils import seed_everything
+
 
 def predict(args):
-	# seed
-	random.seed(args.seed)
-	np.random.seed(args.seed)
-	torch.manual_seed(args.seed)
-
-	# GPU / CPU
-	use_cuda = torch.cuda.is_available()
-	device = torch.device("cuda:{}".format(args.cuda_idx) if torch.cuda.is_available() else "cpu")
-
-	# load data
-	data = XiguaDataset(phase='test',
-	                    data_root=args.data_root,
-	                    split_idx=args.split_idx,
-	                    modalities=args.modalities,
-						mod2feat_dict=args.mod2feat_dict,
-	                    logging=logging)
-
-	# load model
-	model = DMMVED(num_u=args.num_user,
-	               u_in_size=args.user_dim,
-	               u_emb_size=args.user_emb_dim,
-	               dec_type=args.dec_type,
-	               hid_size=args.hid_size,
-	               mod_in_sizes=args.mod2dim_dict,
-	               modalities=args.modalities,
-	               drop_p=args.dropout)
-	trained_model = load_model(model, args.trained_model_path)
-	trained_model.to(device)
-
-	# evaluate
-	nmse, srcc, p_val = evaluate(trained_model, data, args.test_batch_size, use_cuda, device)
-
-	return nmse, srcc, p_val
+    path = Path(args.trained_model_path)
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    training = argparse.Namespace(**checkpoint['train_args'])
+    if training.dataset not in DATASETS:
+        raise ValueError('Checkpoint belongs to the other prediction task')
+    if args.dataset is not None and args.dataset != training.dataset:
+        raise ValueError('Requested dataset differs from the checkpoint')
+    seed_everything(training.seed)
+    training.data_root, training.splits_root = args.data_root, args.splits_root
+    data = PopularityDataset(training, 'test', checkpoint['preprocessing'])
+    device = torch.device(args.device)
+    model = DMMVED(**checkpoint['model_config']).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    metrics, arrays = evaluate(model, data, args.test_batch_size, device, args.num_workers)
+    output = Path(args.output_dir) if args.output_dir else path.parent / 'test'
+    output.mkdir(parents=True, exist_ok=False)
+    np.savez_compressed(output / 'test_predictions.npz', **arrays)
+    result = dict(dataset=training.dataset, split=training.split_idx, epoch=checkpoint['epoch'], metrics=metrics)
+    (output / 'test_metrics.json').write_text(json.dumps(result, indent=2) + '\n')
+    print(json.dumps(result, indent=2))
+    return result
 
 
-if __name__ == "__main__":
-	args = parse_args()
-	args.trained_model_path = ""
-	model_name = os.path.basename(args.trained_model_path)
-	nmse, srcc, p_val = predict(args)
-	metrics = pd.DataFrame([model_name, nmse, srcc, p_val]).transpose()
-	metrics.columns = ['model_info',
-	                   'nmse',
-	                   'srcc',
-	                   'pval']
-	metrics.to_csv(os.path.join(args.trained_model_path, 'test_results.csv'), mode='a', sep='\t', index=False)
+if __name__ == '__main__':
+    predict(parse_args(prediction=True))

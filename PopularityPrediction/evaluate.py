@@ -4,54 +4,52 @@ Pytorch Implementation of MM-DVIB model in:
 Disentangling User Influence and Multimodal Content for Micro-video Popularity Prediction
 '''
 import numpy as np
-import pandas as pd
-from scipy.stats import spearmanr, pearsonr
 import torch
+from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
 
-
-def evaluate(trained_model, data, batch_size, use_cuda=True, device='cpu'):
-    trained_model.eval()
-    total_sample_num = len(data)
-    pop_log_mean = data.target_log_mean
-    pop_log_std = data.target_log_std
-    data_loader = DataLoader(data, batch_size=batch_size, shuffle=False)
-    tgt_pop = np.empty((total_sample_num), dtype=np.float32)
-    out_pop = np.empty((total_sample_num), dtype=np.float32)
-    with torch.no_grad():
-        for idx, batch_data in enumerate(data_loader):
-            u_feat = batch_data['u_feat'].squeeze().to(device)
-            v_feat = batch_data['v_feat']
-            for mod_key in v_feat.keys():
-                v_feat[mod_key] = v_feat[mod_key].to(device)
-            batch_tgt_pop = batch_data['tgt_pop'].squeeze()
-            batch_out_pop = trained_model.predict(u_feat, v_feat)
-            if use_cuda:
-                batch_out_pop = batch_out_pop.cpu()
-            true_batch_size = batch_data['tgt_pop'].shape[0]
-            tgt_pop[idx*batch_size:idx*batch_size+true_batch_size] = batch_tgt_pop
-            out_pop[idx*batch_size:idx*batch_size+true_batch_size] = batch_out_pop
-
-    out_pop = np.exp(out_pop * pop_log_std + pop_log_mean)
-    tgt_pop = np.exp(tgt_pop * pop_log_std + pop_log_mean)
-    nmse = cal_nmse(out_pop, tgt_pop)
-    plcc, _ = pearsonr(out_pop, tgt_pop)
-    srcc, p_val = spearmanr(out_pop, tgt_pop)
-    return nmse, plcc, srcc, p_val
+from utils.utils import model_inputs
 
 
-def cal_nmse(preds, truth):
-    return np.mean(np.square(preds - truth)) / (truth.std() ** 2)
+def calculate_metrics(predictions, targets):
+    predictions, targets = np.asarray(predictions, np.float64), np.asarray(targets, np.float64)
+    if predictions.shape != targets.shape or not np.isfinite(predictions).all() or not np.isfinite(targets).all():
+        raise ValueError('Predictions and targets must have matching shapes and finite values')
+    variance = targets.var()
+    if variance <= 0:
+        raise ValueError('nMSE is undefined for constant targets')
+    metrics = dict(nmse=float(np.mean((predictions - targets) ** 2) / variance), sample_count=len(targets))
+    if targets.ndim == 1:
+        metrics['srcc'] = float(spearmanr(predictions, targets).statistic)
+    else:
+        p = predictions - predictions.mean(axis=1, keepdims=True)
+        y = targets - targets.mean(axis=1, keepdims=True)
+        denominator = np.linalg.norm(p, axis=1) * np.linalg.norm(y, axis=1)
+        valid = denominator > 0
+        if not valid.any():
+            raise ValueError('PLCC is undefined for all target/prediction sequences')
+        correlations = (p[valid] * y[valid]).sum(axis=1) / denominator[valid]
+        metrics['plcc'] = float(correlations.mean())
+        metrics['valid_plcc_samples'] = int(valid.sum())
+    return metrics
 
 
-if __name__ == "__main__":
-    # for test only
-    from data import XiguaDataset
-    mod2feat_dict = {
-        'visual': 'resnet50',
-        'aural': 'audiovgg',
-        'textual': 'fudannlp'
-    }
-    data4test = XiguaDataset('test', 9, './data', 10, ['visual', 'textual'], mod2feat_dict)
-    result = evaluate(None, data4test, 256)
-    print(['%.5f'%i for i in result])
+@torch.no_grad()
+def evaluate(model, data, batch_size, device, num_workers=0):
+    model.eval()
+    predictions, targets, indices = [], [], []
+    loader = DataLoader(data, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                        pin_memory=device.type == 'cuda', persistent_workers=num_workers > 0)
+    for batch in loader:
+        predictions.append(model.predict(*model_inputs(batch, device)).cpu().numpy())
+        targets.append(batch['tgt_pop'].numpy())
+        indices.append(batch['index'].numpy())
+    predictions, targets = np.concatenate(predictions), np.concatenate(targets)
+    arrays = dict(sample_indices=np.concatenate(indices), predictions_norm=predictions, targets_norm=targets)
+    if targets.ndim == 1:
+        predictions = predictions.astype(np.float64) * data.target_std + data.target_mean
+        targets = targets.astype(np.float64) * data.target_std + data.target_mean
+        if data.transform == 'log':
+            predictions, targets = np.exp(predictions), np.exp(targets)
+        arrays.update(predictions_raw=predictions, targets_raw=targets)
+    return calculate_metrics(predictions, targets), arrays

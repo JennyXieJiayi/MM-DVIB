@@ -3,105 +3,63 @@
 Pytorch Implementation of MM-DVIB model in:
 Disentangling User Influence and Multimodal Content for Micro-video Popularity Prediction
 '''
-import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
-class XiguaDataset(Dataset):
-	def __init__(self, phase, data_root, split_idx, modalities, mod2feat_dict, logging=None, num_test_neg=None):
-		assert phase in ['train', 'val', 'test']
-
-		train_idx_path = os.path.join(data_root, 'split/{}'.format(split_idx), 'train.txt')
-		train_idx = pd.read_table(train_idx_path, header=None).values.squeeze()
-
-		phase_idx_path = os.path.join(data_root, 'split/{}'.format(split_idx), '{}.txt'.format(phase))
-		phase_idx = pd.read_table(phase_idx_path, header=None).values.squeeze()
-
-		vuid_file = os.path.join(data_root, 'vuid_list.txt')
-		vuids_all = pd.read_table(vuid_file, header=None, dtype=str)
-		vuids_all.columns = ['vid', 'uid']
-
-		target_file = os.path.join(data_root, 'target.npy')
-		target_ori_all = np.load(target_file)[:, 0]
-
-		target_log = np.log(target_ori_all)
-		self.target_log_mean = target_log.mean()
-		self.target_log_std = target_log.std()
-		target_log_norm = (target_log - self.target_log_mean) / self.target_log_std
-		self.target = target_log_norm[phase_idx]
-
-		u_feat_file = os.path.join(data_root, 'user.npy')
-		self.u_feat = np.load(u_feat_file)[phase_idx]
-
-		self.v_feat = {}
-		for modality in modalities:
-			mod_file = os.path.join(data_root, "{}.npy".format(mod2feat_dict[modality]))
-			self.v_feat[modality] = np.load(mod_file)[phase_idx]
-
-		self.user_pop = self.get_mean_pop(vuids_all, target_ori_all, train_idx, phase_idx) # log norm pop
-
-	def get_mean_pop(self, vuids, target, train_idxes, phase_idxes):
-		### use train set to calculate mean pop
-		### new users in test / val use zero mean pop
-
-		# 1. calculate the mean pop of users in train set
-		uids_known = vuids['uid'][train_idxes].tolist()
-		target_known = target[train_idxes]
-		unique_uids = list(set(uids_known))
-		uids_vcount = np.zeros(len(unique_uids))
-		uids_sum_pop = np.zeros(len(unique_uids))
-		for idx, uid in enumerate(uids_known):
-			uids_vcount[unique_uids.index(uid)] += 1
-			uids_sum_pop[unique_uids.index(uid)] += target_known[idx]
-		uids_mean_pop = uids_sum_pop / uids_vcount
-		uids_mean_log_pop = np.log(uids_mean_pop)
-		uids_mean_log_norm_pop = (uids_mean_log_pop - self.target_log_mean) / self.target_log_std # normalization
-		uids_mean_log_pop_missing = np.zeros_like(uids_mean_log_pop[0])
-
-		# 2. map to the phase set
-		vids_mean_log_norm_pop = np.zeros((len(phase_idxes)))
-		vids_unknown = vuids['vid'][phase_idxes].tolist()
-		uids_unknown = vuids['uid'][phase_idxes].tolist()
-		for idx, (vid, uid) in enumerate(zip(vids_unknown, uids_unknown)):
-			if uid in unique_uids:
-				vids_mean_log_norm_pop[idx] = uids_mean_log_norm_pop[unique_uids.index(uid)]
-			else:
-				vids_mean_log_norm_pop[idx] = uids_mean_log_pop_missing
-		return vids_mean_log_norm_pop
-
-	def __len__(self):
-		return len(self.target)
-
-	def __getitem__(self, index):
-		samples = {
-			'u_feat': torch.tensor([self.u_feat[index]], dtype=torch.float32),
-			'v_feat': {key: torch.tensor(mod[index], dtype=torch.float32) for key, mod in self.v_feat.items()},
-			'tgt_pop': torch.tensor([self.target[index]], dtype=torch.float32),
-			'tgt_mean_pop': torch.tensor([self.user_pop[index]], dtype=torch.float32)
-		}
-		return samples
+from utils.data_utils import load_splits, prepare_users, user_targets, check_features
 
 
-if __name__ == "__main__":
-	# for test only
-	modalities = ['visual', 'aural', 'textual']
-	mod2feat_dict = {
-		'visual': 'visual',
-		'aural': 'aural',
-		'textual': 'textual'
-	}
-	data4test = XiguaDataset('train', './data/', 10, modalities, mod2feat_dict)
-	print(len(data4test)) # total sample num
-	dataloader4test = DataLoader(data4test, batch_size=128, shuffle=True)
-	print(len(dataloader4test)) # batch num
-	for i_batch, batch_data in enumerate(dataloader4test):
-		print(batch_data['u_feat'].shape)
-		print(batch_data['v_feat'].keys())
-		print(batch_data['v_feat']['visual'].shape)
-		print(batch_data['v_feat']['aural'].shape)
-		print(batch_data['v_feat']['textual'].shape)
-		print(batch_data['tgt_pop'].shape)
-		print(batch_data['tgt_mean_pop'].shape)
-		break
+class PopularityDataset(Dataset):
+    def __init__(self, args, phase, preprocessing=None):
+        root = Path(args.data_root)
+        target = np.load(root / 'target.npy')[:, 0]
+        splits, hashes = load_splits(args.splits_root, args.dataset, args.split_idx, len(target))
+        self.indices = splits[phase]
+        self.transform = args.target_transform
+        if self.transform == 'log':
+            if np.any(target <= 0):
+                raise ValueError('Log popularity targets must be positive')
+            transformed = np.log(target)
+        else:
+            transformed = np.asarray(target, dtype=np.float64)
+        if preprocessing is None:
+            train_target = transformed[splits['train']]
+            target_state = dict(mean=float(train_target.mean()), std=float(train_target.std()))
+            user_state = None
+        else:
+            if preprocessing['split_hashes'] != hashes:
+                raise ValueError('Checkpoint and data splits differ')
+            target_state, user_state = preprocessing['target'], preprocessing['user']
+        self.target_mean, self.target_std = target_state['mean'], target_state['std']
+        if self.target_std <= 0 or not np.isfinite(self.target_std):
+            raise ValueError('Invalid target variance')
+        self.target = ((transformed[self.indices] - self.target_mean) / self.target_std).astype(np.float32)
+        users = np.load(root / 'user.npy')
+        if users.shape != (len(target), args.user_dim):
+            raise ValueError('User feature shape does not match the dataset configuration')
+        self.users, self.user_state = prepare_users(users, splits['train'], user_state)
+        self.features = {name: np.load(root / f'{filename}.npy', mmap_mode='r')
+                         for name, filename in args.mod2feat_dict.items()}
+        check_features(self.features, args.mod2dim_dict, len(target))
+        ids = pd.read_csv(root / 'vuid_list.txt', sep='\t', header=None, dtype=str)
+        if ids.shape != (len(target), 2):
+            raise ValueError('vuid_list.txt must align with feature rows')
+        self.user_pop = user_targets(ids.iloc[:, 1].to_numpy(), target, splits['train'],
+                                     self.target_mean, self.target_std, self.transform)
+        self.preprocessing = dict(target=target_state, user=self.user_state, split_hashes=hashes)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, position):
+        index = self.indices[position]
+        return dict(u_feat=torch.tensor(self.users[index], dtype=torch.float32),
+                    v_feat={name: torch.tensor(value[index], dtype=torch.float32)
+                            for name, value in self.features.items()},
+                    tgt_pop=torch.tensor(self.target[position]),
+                    tgt_mean_pop=torch.tensor(self.user_pop[index]),
+                    index=torch.tensor(index))
